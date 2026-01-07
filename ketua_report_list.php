@@ -13,13 +13,35 @@ $username = $_SESSION['user_name'];
 $message = "";
 $status = "";
 
-// 2. CHECK FOR SUCCESS URL PARAMETERS (From redirects)
+// 2. Fetch Kampung Details (Preserved from original)
+$kampung_id = '';
+$kampung_name = '';
+
+$stmt = $conn->prepare("
+    SELECT uk.kampung_id, k.kampung_name
+    FROM user_kampung uk
+    JOIN tbl_kampung k ON uk.kampung_id = k.kampung_id
+    WHERE uk.user_id = ?
+    LIMIT 1
+");
+$stmt->bind_param("i", $ketua_id);
+$stmt->execute();
+$stmt->bind_result($kampung_id, $kampung_name);
+$stmt->fetch();
+$stmt->close();
+
+// 3. CHECK FOR SUCCESS URL PARAMETERS (From redirects)
 if (isset($_GET['success']) && $_GET['success'] == 1) {
     $status = "success";
     $message = "Report approved and feedback submitted successfully!";
 }
+// Handle potential error params if needed
+if (isset($_GET['error'])) {
+    $status = "error";
+    $message = urldecode($_GET['error']);
+}
 
-// 3. HANDLE FORM SUBMISSION (Approve Report)
+// 4. HANDLE FORM SUBMISSION (Approve Report - Integrated Logic)
 if (isset($_POST['submitreport'])) {
     $report_id = (int) $_POST['report_id'];
     $rpt_status = "Approved"; // Fixed status
@@ -31,7 +53,7 @@ if (isset($_POST['submitreport'])) {
     if (!preg_match($pattern, $raw_feedback)) {
         // Validation Failed -> Set Error Modal
         $status = "error";
-        $message = "Feedback format is invalid.";
+        $message = "Feedback format is invalid. Only letters, numbers, spaces, dots, commas, and dashes allowed (3-100 chars).";
     } else {
         // Validation Passed -> Update DB
         $feedback = mysqli_real_escape_string($conn, $raw_feedback);
@@ -53,7 +75,7 @@ if (isset($_POST['submitreport'])) {
     }
 }
 
-// 4. Fetch reports for this villager ONLY
+// 5. Fetch reports for this villager ONLY
 $sql = "
     SELECT
         rpt.*,
@@ -68,10 +90,9 @@ $sql = "
         END,
         rpt.report_date ASC
 ";
-
 $result = mysqli_query($conn, $sql);
 
-// 5. SOS Query
+// 6. SOS Query
 $sqlsos =  "SELECT 
         s.*,
         u.user_name AS villager_name
@@ -81,6 +102,35 @@ $sqlsos =  "SELECT
     ORDER BY s.created_at ASC";
 $resultsos = mysqli_query($conn, $sqlsos);
 $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
+
+// 7. Generate Pins for Full Map (To fix the sidebar map issue)
+$pins = [];
+// Add reports to pins
+$map_result = mysqli_query($conn, $sql); // Reuse query logic or fetch again if needed
+while($row = mysqli_fetch_assoc($map_result)){
+    if($row['report_status'] == 'Pending') {
+        $pins[] = [
+            'type' => 'report',
+            'latitude' => $row['latitude'],
+            'longitude' => $row['longitude'],
+            'report_title' => $row['report_title'],
+            'report_type' => $row['report_type'],
+            'report_status' => $row['report_status'],
+            'submitted_by' => $row['villager_name']
+        ];
+    }
+}
+// Add SOS to pins
+foreach($sosList as $s){
+    $pins[] = [
+        'type' => 'sos',
+        'latitude' => $s['latitude'],
+        'longitude' => $s['longitude'],
+        'sos_status' => $s['sos_status'],
+        'sent_by' => $s['villager_name']
+    ];
+}
+$json_pins = json_encode($pins);
 ?>
 
 <!DOCTYPE html>
@@ -227,10 +277,13 @@ $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
             <h2>Ketua Kampung - <?php echo $username; ?></h2>
             <ul>
                 <li><a href="ketuakampung_dashboard.php"><i class="fa fa-home"></i> Home</a></li>
-                <li><a href="#"><i class="fa fa-edit"></i> Monitor Village Reports</a></li>
-                <li><a href="ketua_annoucment_list.php"><i class="fa fa-calendar-plus"></i> Announcements</a></li>
-                <li><a href="#"><i class="fa fa-comments"></i> Communicate with Penghulu</a></li>
-                <li><a href="#"><i class="fa-solid fa-map-location-dot"></i> Incident Map</a></li>
+                <li><a href="ketua_report_list.php"><i class="fa fa-edit"></i> Monitor Village Reports - Notify Village</a></li>
+                <li><a href="ketua_annoucment_list.php"><i class="fa fa-calendar-plus"></i> Announcement for villagers</a></li>
+                <li>
+                    <a href="javascript:void(0)" onclick="openFullMap()">
+                        <i class="fa-solid fa-map-location-dot"></i> Incident Map
+                    </a>
+                </li>
                 <li><a href="../../logout.php"><i class="fa fa-sign-out-alt"></i> Logout</a></li>
             </ul>
         </div>
@@ -238,7 +291,7 @@ $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
         <div class="main">
             <div class="header">
                 <h1>My Reports</h1>
-                <p>Logged in as: <?= htmlspecialchars($username) ?></p>
+                <p>Logged in as: <?= htmlspecialchars($username) ?> from <?= htmlspecialchars($kampung_name) ?></p>
             </div>
 
             <div class="table-soscontainer">
@@ -280,13 +333,18 @@ $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
                         <th>Description</th>
                         <th>Date</th>
                         <th>Location</th>
+                        <th>View Map</th>
                         <th>Penduduk</th>
                         <th>Status</th>
                         <th>Action</th>
                     </tr>
 
                     <?php if (mysqli_num_rows($result) > 0): ?>
-                        <?php $i = 1; while ($row = mysqli_fetch_assoc($result)): ?>
+                        <?php 
+                        // Reset pointer because we used it for map generation
+                        mysqli_data_seek($result, 0);
+                        $i = 1; 
+                        while ($row = mysqli_fetch_assoc($result)): ?>
                             <tr>
                                 <td><?= $i++ ?></td>
                                 <td><?= htmlspecialchars($row['report_title']) ?></td>
@@ -294,13 +352,22 @@ $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
                                 <td><?= htmlspecialchars($row['report_desc']) ?></td>
                                 <td><?= htmlspecialchars($row['report_date']) ?></td>
                                 <td><?= htmlspecialchars($row['report_location']) ?></td>
+                                <td>
+                                    <button onclick="viewMap(
+                                            '<?= $row['latitude'] ?>', 
+                                            '<?= $row['longitude'] ?>'
+                                            )">
+                                        📍 View Map
+                                    </button>
+                                </td>
                                 <td><?= htmlspecialchars($row['villager_name']) ?></td>
                                 <td class="status-<?= strtolower($row['report_status']) ?>">
                                     <?= htmlspecialchars($row['report_status']) ?>
                                 </td>
                                 <td>
-                                      <?php if ($row['report_status'] === 'Pending'): ?>
+                                    <?php if ($row['report_status'] === 'Pending'): ?>
                                         <button class="btn btn-success"
+                                            style="background-color:#28a745; color:white; border:none; padding:5px 10px; border-radius:4px; cursor:pointer;"
                                             onclick="openForm(
                                             <?= $row['report_id'] ?>,
                                             '<?= htmlspecialchars(addslashes($row['report_title'])) ?>',
@@ -310,11 +377,13 @@ $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
                                         </button>
 
                                         <button class="btn btn-danger"
+                                            style="background-color:#dc3545; color:white; border:none; padding:5px 10px; border-radius:4px; cursor:pointer;"
                                             onclick="rejectReport(<?= $row['report_id'] ?>)">
                                             Reject
                                         </button>
 
                                         <button class="btn btn-warning"
+                                            style="background-color:#ffc107; color:black; border:none; padding:5px 10px; border-radius:4px; cursor:pointer;"
                                             onclick="deleteReport(<?= $row['report_id'] ?>)">
                                             Delete
                                         </button>
@@ -328,7 +397,7 @@ $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
                             </tr>
                         <?php endwhile; ?>
                     <?php else: ?>
-                        <tr><td colspan="9" style="text-align:center;">No reports submitted yet</td></tr>
+                        <tr><td colspan="10" style="text-align:center;">No reports submitted yet</td></tr>
                     <?php endif; ?>
                 </table>
             </div>
@@ -336,7 +405,6 @@ $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
 
         <div id="reportform">
             <form method="POST" action="" class="reportformketua">
-
                 <div class="form-card">
                     <span class="close" onclick="closeForm()" style="float:right; cursor:pointer; font-size:20px;">&times;</span>
                     <h2>Submit Feedback</h2>
@@ -355,6 +423,21 @@ $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
                     <button class="btn" name="submitreport">Confirm Approval</button>
                 </div>
             </form>
+        </div>
+        
+        <div id="mapModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:999; justify-content:center; align-items:center;">
+            <div style="background:#fff; width:90%; max-width:600px; padding:10px; border-radius:8px;">
+                <h3>Incident Location</h3>
+                <div id="viewMap" style="height:350px;"></div>
+                <button onclick="closeMap()" style="margin-top:10px; padding:5px 10px; cursor:pointer;">Close</button>
+            </div>
+        </div>
+
+        <div id="fullMapModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.8); z-index:9999;">
+            <div style="position:relative; width:100%; height:100%;">
+                <span style="position:absolute; top:10px; right:20px; font-size:30px; color:white; cursor:pointer; z-index:1000;" onclick="closeFullMap()">&times;</span>
+                <div id="fullIncidentMap" style="width:100%; height:100%;"></div>
+            </div>
         </div>
 
     </div>
@@ -382,12 +465,19 @@ $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
     <?php endif; ?>
 
     <script>
+        // --- 1. Map Icons ---
         var redIcon = L.icon({
             iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png',
             shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
             iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34]
         });
+        var greenIcon = L.icon({
+            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-green.png',
+            shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+            iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34]
+        });
 
+        // --- 2. SOS Map Initialization ---
         const sosData = <?= json_encode($sosList); ?>;
         let sosMap = L.map('sosMap').setView([6.43782726, 100.19387055], 15);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(sosMap);
@@ -399,6 +489,7 @@ $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
                 .bindPopup(`<b>🚨 SOS Alert</b><br><b>Villager:</b> ${sos.villager_name}<br><b>Message:</b> ${sos.sos_msg ?? 'N/A'}<br><b>Time:</b> ${sos.created_at}`);
         });
 
+        // --- 3. Form & Modal Functions ---
         function openForm(reportId, title, villager) {
             document.getElementById("reportform").style.display = "flex";
             document.getElementById("report_id").value = reportId;
@@ -407,9 +498,9 @@ $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
         }
 
         function closeForm() { document.getElementById("reportform").style.display = "none"; }
-
         function closeModal() { document.querySelector('.modal-overlay').style.display = 'none'; }
 
+        // --- 4. Action Functions ---
         function deleteReport(reportId) {
             if (confirm("Are you sure you want to delete this report?")) {
                 window.location.href = "delete_report.php?report_id=" + reportId;
@@ -427,8 +518,57 @@ $sosList = mysqli_fetch_all($resultsos, MYSQLI_ASSOC);
                 window.location.href = "resolve_sos.php?sos_id=" + sosId;
             }
         }
+
+        // --- 5. View Map (Single) ---
+        let viewMapObj;
+        let viewMarker;
+        function viewMap(lat, lng) {
+            document.getElementById("mapModal").style.display = "flex";
+            setTimeout(() => {
+                if (viewMapObj) { viewMapObj.remove(); }
+                viewMapObj = L.map('viewMap').setView([lat, lng], 15);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(viewMapObj);
+                viewMarker = L.marker([lat, lng]).addTo(viewMapObj).bindPopup("Incident Location").openPopup();
+            }, 200);
+        }
+        function closeMap() { document.getElementById("mapModal").style.display = "none"; }
+
+        // --- 6. Full Incident Map ---
+        var pins = <?= $json_pins; ?>; // Generated from PHP
+        function openFullMap() {
+            document.getElementById('fullMapModal').style.display = 'block';
+
+            setTimeout(() => {
+                if (window.fullMap) { window.fullMap.remove(); }
+                window.fullMap = L.map('fullIncidentMap').setView([6.4432, 100.2056], 13);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(window.fullMap);
+
+                pins.forEach(function(pin) {
+                    if (pin.latitude && pin.longitude) {
+                        let icon, popupContent;
+                        if (pin.type === 'report') {
+                            icon = greenIcon;
+                            popupContent = `<b>Report: ${pin.report_type}</b><br>
+                                Title: ${pin.report_title}<br>
+                                Status: ${pin.report_status}<br>
+                                Submitted by: ${pin.submitted_by}`;
+                        } else if (pin.type === 'sos') {
+                            icon = redIcon;
+                            popupContent = `<b>SOS Alert</b><br>
+                                Status: ${pin.sos_status}<br>
+                                Sent by: ${pin.sent_by}`;
+                        }
+                        L.marker([pin.latitude, pin.longitude], { icon: icon }).addTo(window.fullMap).bindPopup(popupContent);
+                    }
+                });
+            }, 200);
+        }
+
+        function closeFullMap() {
+            document.getElementById('fullMapModal').style.display = 'none';
+            if (window.fullMap) window.fullMap.remove();
+        }
     </script>
 
 </body>
 </html>
-
